@@ -535,8 +535,8 @@ static void setup_ibs_lvt(void *err)
 	entry = apic_read(reg);
 
 	/* Print the 2 LSB in APIC register : | mask | msg_type | vector | */
-	pr_info("[APIC] CPU %u - READ offset %u -> | %lu | %lu | %lu |\n", smp_processor_id(), offset,
-								((entry >> 16) & 0xFUL), ((entry >> 8) & 0xFUL), (entry & 0xFFUL));
+	pr_info("IBS: APIC of CPU %u - READ offset %u -> | %lu | %lu | %lu |\n",
+		smp_processor_id(), offset, ((entry >> 16) & 0xFUL), ((entry >> 8) & 0xFUL), (entry & 0xFFUL));
 
 	new_entry = (0UL) | (APIC_EILVT_MSG_FIX << 8) | (ibs_vector);
 

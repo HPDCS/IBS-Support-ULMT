@@ -1,15 +1,20 @@
+#include <linux/types.h>
+#include <linux/smp.h>
+#include <linux/percpu.h>
+#include <linux/sched.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/interrupt.h>
+#include <linux/kprobes.h>
+#include <linux/device.h>
+#include <linux/delay.h>
+#include <linux/version.h>
+#include <asm/irq_regs.h>
 #include <asm/irq.h>
 #include <asm/desc.h>
 #include <asm/apic.h>
 #include <asm/apicdef.h>
 #include <asm/uaccess.h>
-#include <linux/smp.h>
-#include <linux/percpu.h>
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/interrupt.h>
-#include <linux/device.h>
-#include <linux/delay.h>
 
 #include "ibs-api.h"
 
@@ -82,12 +87,17 @@ void handle_ibs_irq(struct pt_regs *regs);
 /*             APIC CONFIGURATION AND IBS REGISTERS INITIALIZATION              */
 /*                          (variables and functions)                           */
 
-unsigned ibs_vector = 0xffU;
+static unsigned ibs_vector = NR_VECTORS-1;
 
-int ibs_op_supported;
-int ibs_fetch_supported;
+static int ibs_op_supported;
+static int ibs_fetch_supported;
 
-gate_desc old_ibs;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+static unsigned int old_call_operand = 0x0;
+static unsigned int new_call_operand = 0x0;
+static unsigned int *call_operand_address = NULL;
+#else
+static gate_desc old_ibs;
 
 
 extern void ibs_entry(void);
@@ -139,6 +149,8 @@ asm(
 "2:\n"
 "    iretq"
 );
+#endif
+
 
 int check_for_ibs_support(void)
 {
@@ -149,19 +161,19 @@ int check_for_ibs_support(void)
 
 	if (c->x86_vendor != X86_VENDOR_AMD)
 	{
-		pr_err("IBS ERROR: required AMD processor.\n");
+		pr_err("IBS: required AMD processor.\n");
 		return -EINVAL;
 	}
 
 	if (c->x86 != CPUID_AMD_FAM10h)
 	{
-		pr_err("IBS ERROR: this module is designed only for Fam 10h\n");
+		pr_err("IBS: this module is designed only for Fam 10h\n");
 		return -EINVAL;
 	}
 
 	if (!(CPUID_Fn8000_0001_ECX & IBS_SUPPORT_EXIST))
 	{
-		pr_err("IBS ERROR: CPUID_Fn8000_0001 indicates no IBS support\n");
+		pr_err("IBS: CPUID_Fn8000_0001 indicates no IBS support\n");
 		return -EINVAL;	
 	}
 
@@ -169,7 +181,7 @@ int check_for_ibs_support(void)
 
 	if (!(feature_id & IBS_CPUID_IBSFFV))
 	{
-		pr_err("IBS ERROR: CPUID_Fn8000_001B indicates no IBS support\n");
+		pr_err("IBS: CPUID_Fn8000_001B indicates no IBS support\n");
 		return -EINVAL;
 	}
 
@@ -180,42 +192,280 @@ int check_for_ibs_support(void)
 
 	if (!ibs_fetch_supported)
 	{
-		pr_err("IBS ERROR: CPUID_Fn800_001B says no Op support\n");
+		pr_err("IBS: CPUID_Fn800_001B says no Op support\n");
 		return -EINVAL;
 	}
 
 	if (!ibs_op_supported)
 	{
-		pr_err("IBS ERROR: CPUID_Fn800_001B says no Fetch support\n");
+		pr_err("IBS: CPUID_Fn800_001B says no Fetch support\n");
 		return -EINVAL;
 	}
 	
 	return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+static int select_vector_by_inspect_push_operand(unsigned char *byte)
+{
+	unsigned int opcode;
+	unsigned int operand;
+
+	opcode = ((unsigned int) byte[0]) & 0xff;
+
+	if (opcode == 0x68) /* push imm16/imm32 */
+	{
+		operand = ~(((unsigned int) byte[1]) | (((unsigned int) byte[2]) << 8) |
+			(((unsigned int) byte[3]) << 16) | (((unsigned int) byte[4]) << 24));
+		if (operand == 0xFF) /* SPURIOUS_APIC_VECTOR */
+			return 1;
+	}
+	else if (opcode == 0x6A) /* push imm8 */
+	{
+		operand = ~(((unsigned int) byte[1]) & 0xff);
+		if (operand == 0xFF) /* SPURIOUS_APIC_VECTOR */
+			return 1;
+	}
+
+	return 0;
+}
+
+# if LINUX_VERSION_CODE >= KERNEL_VERSION(5,2,2)
+static long select_vector_by_counting_jmp_addresses(unsigned char *byte)
+{
+	unsigned int opcode;
+	unsigned int operand;
+
+	opcode = ((unsigned int) byte[0]) & 0xff;
+
+	if (opcode == 0x68) /* push imm16/imm32 */
+	{
+		opcode = ((unsigned int) byte[5]) & 0xff;
+
+		if (opcode == 0xE9) /* jmp imm16/imm32 */
+		{
+			operand = ((unsigned int) byte[6]) | (((unsigned int) byte[7]) << 8) |
+				(((unsigned int) byte[8]) << 16) | (((unsigned int) byte[9]) << 24);
+			return ((long) &byte[10]) + (long) operand; /* RIP + operand */
+		}
+		else if (opcode == 0xEB) /* jmp imm8 */
+		{
+			operand = ((unsigned int) byte[6]) & 0xff;
+			return ((long) &byte[7]) + (long) operand; /* RIP + operand */
+		}
+	}
+	else if (opcode == 0x6A) /* push imm8 */
+	{
+		opcode = ((unsigned int) byte[2]) & 0xff;
+
+		if (opcode == 0xE9) /* jmp imm16/imm32 */
+		{
+			operand = ((unsigned int) byte[3]) | (((unsigned int) byte[4]) << 8) |
+				(((unsigned int) byte[5]) << 16) | (((unsigned int) byte[6]) << 24);
+			return ((long) &byte[7]) + (long) operand; /* RIP + operand */
+		}
+		else if (opcode == 0xEB) /* jmp imm8 */
+		{
+			operand = ((unsigned int) byte[3]) & 0xff;
+			return ((long) &byte[4]) + (long) operand; /* RIP + operand */
+		}
+	}
+
+	return 0;
+}
+# endif
+#endif
+
 static int acquire_free_vector(void)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+	struct desc_ptr idtr;
+	gate_desc *gate_ptr;
+
+# if LINUX_VERSION_CODE >= KERNEL_VERSION(5,2,2)
+	int i;
+	long addr;
+	unsigned int max_count;
+	long address[NR_VECTORS-FIRST_SYSTEM_VECTOR+1] = { 0 };
+	unsigned int vector[NR_VECTORS-FIRST_SYSTEM_VECTOR+1] = { 0 };
+	unsigned int counter[NR_VECTORS-FIRST_SYSTEM_VECTOR+1] = { 0 };
+# endif
+
+	store_idt(&idtr);
+
+	while (1)
+	{
+		if (ibs_vector < FIRST_SYSTEM_VECTOR)
+		{
+# if LINUX_VERSION_CODE >= KERNEL_VERSION(5,2,2)
+			for (max_count=1, i=0; i<NR_VECTORS-FIRST_SYSTEM_VECTOR+1; i++)
+			{
+				if (counter[i] > max_count)
+				{
+					ibs_vector = vector[i];
+					max_count = counter[i];
+				}
+			}
+
+			if (max_count > 1)
+				break;
+# endif
+			pr_err("IBS: no free IDT vector is found.\n");
+			return -ENODATA;
+		}
+
+		gate_ptr = (gate_desc *) (idtr.address + ibs_vector * sizeof(gate_desc));
+
+		if (select_vector_by_inspect_push_operand((unsigned char *) (((unsigned long) gate_ptr->offset_low) |
+																		((unsigned long) gate_ptr->offset_middle << 16) |
+																			((unsigned long) gate_ptr->offset_high << 32))))
+			break;
+
+# if LINUX_VERSION_CODE >= KERNEL_VERSION(5,2,2)
+		addr = select_vector_by_counting_jmp_addresses((unsigned char *) (((unsigned long) gate_ptr->offset_low) |
+																				((unsigned long) gate_ptr->offset_middle << 16) |
+																					((unsigned long) gate_ptr->offset_high << 32)));
+
+		for (i=0; i<NR_VECTORS-FIRST_SYSTEM_VECTOR+1; i++)
+		{
+			if (address[i] == 0 || address[i] == addr)
+			{
+				counter[i] += 1;
+				if (address[i] == 0)
+				{
+					vector[i] = ibs_vector;
+					address[i] = addr;
+				}
+				break;
+			}
+		}
+# endif
+
+		ibs_vector--;
+	}
+#else
 	while (test_bit(ibs_vector, used_vectors))
 	{
 		if (ibs_vector == 0x40)
 		{
-			pr_err("IBS ERROR: no free vector found\n");
+			pr_err("IBS: no free IDT vector is found.\n");
 			return -1;
 		}
 		ibs_vector--;
 	}
 	set_bit(ibs_vector, used_vectors);
+#endif
 
-	pr_info("IBS: got vector 0x%x\n", ibs_vector);
+	pr_info("IBS: IDT vector 0x%x acquired.\n", ibs_vector);
 
 	return 0;
 }
 
+static unsigned long _force_order_;
+
+static inline unsigned long _read_cr0(void)
+{
+	unsigned long val;
+	asm volatile("mov %%cr0, %0" : "=r" (val), "=m" (_force_order_));
+	return val;
+}
+
+static inline void _write_cr0(unsigned long val)
+{
+	asm volatile("mov %0, %%cr0" : : "r" (val), "m" (_force_order_));
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+static inline long get_address_entry_idt(unsigned int vector)
+{
+    struct desc_ptr idtr;
+    gate_desc *gate_ptr;
+
+    store_idt(&idtr);
+
+    gate_ptr = (gate_desc *) (idtr.address + vector * sizeof(gate_desc));
+
+    return (long) ((unsigned long) (gate_ptr->offset_low) |
+    				((unsigned long) (gate_ptr->offset_middle) << 16) |
+    					((unsigned long) (gate_ptr->offset_high) << 32));
+}
+
+static inline int get_address_from_symbol(unsigned long *address, const char *symbol)
+{
+    struct kprobe kp = {};
+
+    kp.symbol_name = symbol;
+
+    if (register_kprobe(&kp) < 0)
+    {
+        pr_err("IBS: symbol %s not found.\n", symbol);
+        return -ENODATA;
+    }
+
+    *address = (unsigned long) kp.addr;
+
+    unregister_kprobe(&kp);
+
+    pr_info("IBS: symbol %s is with the address 0x%lx.\n", symbol, *address);
+
+    return 0;
+}
+#endif
+
 static int setup_idt_entry(void)
 {
+	unsigned long cr0;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+	int i;
+	unsigned char *byte;
+	unsigned int operand;
+	unsigned long entry_spurious_address;
+	unsigned long smp_spurious_address;
+	unsigned long expected_smp_spurious_address;
+
+	if (!(entry_spurious_address = get_address_entry_idt(ibs_vector)))
+		return -ENODATA;
+
+	if (get_address_from_symbol(&smp_spurious_address, "smp_spurious_interrupt"))
+		return -ENODATA;
+
+	byte = (unsigned char *) entry_spurious_address;
+
+	for (i=0; i<512; i++)
+	{
+		if (byte[i] == 0xE8)
+		{
+			operand = ((unsigned int) byte[i+1]) | (((unsigned int) byte[i+2]) << 8) |
+				(((unsigned int) byte[i+3]) << 16) | (((unsigned int) byte[i+4]) << 24);
+
+			expected_smp_spurious_address = (unsigned long) (((long) &byte[i+5]) + (long) operand);
+
+			if (expected_smp_spurious_address == smp_spurious_address)
+			{
+				old_call_operand = operand;
+				new_call_operand = (unsigned int) ((long) handle_ibs_irq - ((long) &byte[i+5]));
+				call_operand_address = (unsigned int *) &byte[i+1];
+
+				cr0 = _read_cr0();
+				_write_cr0(cr0 & ~X86_CR0_WP);
+
+# if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
+				arch_cmpxchg(call_operand_address, old_call_operand, new_call_operand);
+# else
+				cmpxchg(call_operand_address, old_call_operand, new_call_operand);
+# endif
+
+				_write_cr0(cr0);
+
+				return 0;
+			}
+		}
+	}
+
+	return -ENODATA;
+#else
 	struct desc_ptr idtr;
 	gate_desc ibs_desc;
-	unsigned long cr0;
 
 	store_idt(&idtr);
 
@@ -223,29 +473,44 @@ static int setup_idt_entry(void)
 	
 	pack_gate(&ibs_desc, GATE_INTERRUPT, (unsigned long)ibs_entry, 0, 0, 0);
 
-	cr0 = read_cr0();
-	write_cr0(cr0 & ~X86_CR0_WP);
+	cr0 = _read_cr0();
+	_write_cr0(cr0 & ~X86_CR0_WP);
 
 	write_idt_entry((gate_desc*)idtr.address, ibs_vector, &ibs_desc);
 
-	write_cr0(cr0);
+	_write_cr0(cr0);
 
 	return 0;
+#endif
 }
 
 static void restore_idt_entry(void)
 {
-	struct desc_ptr idtr;
 	unsigned long cr0;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+	cr0 = _read_cr0();
+	_write_cr0(cr0 & ~X86_CR0_WP);
+
+# if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
+	arch_cmpxchg(call_operand_address, new_call_operand, old_call_operand);
+# else
+	cmpxchg(call_operand_address, new_call_operand, old_call_operand);
+# endif
+
+	_write_cr0(cr0);
+#else
+	struct desc_ptr idtr;
 
 	store_idt(&idtr);
 
-	cr0 = read_cr0();
-	write_cr0(cr0 & ~X86_CR0_WP);
+	cr0 = _read_cr0();
+	_write_cr0(cr0 & ~X86_CR0_WP);
 
 	write_idt_entry((gate_desc*)idtr.address, ibs_vector, &old_ibs);
 
-	write_cr0(cr0);
+	_write_cr0(cr0);
+#endif
 }
 
 static void setup_ibs_lvt(void *err)
@@ -259,7 +524,7 @@ static void setup_ibs_lvt(void *err)
 	rdmsrl(MSR_IBS_CONTROL, ibs_ctl);
 	if (!(ibs_ctl & IBS_LVT_OFFSET_VAL))
 	{
-		pr_err("IBS ERROR: APIC setup failed - invalid offset by MSR_bits: %llu\n", ibs_ctl);
+		pr_err("IBS: APIC setup failed - invalid offset by MSR_bits: %llu\n", ibs_ctl);
 		goto no_offset;
 	}
 
@@ -295,11 +560,12 @@ static void setup_ibs_lvt(void *err)
 	return;
 
 fail:
-	pr_err("IBS ERROR: APIC setup failed - cannot set up the LVT entry 0x%x on cpu %i\n", offset, smp_processor_id());
+	pr_err("IBS: APIC setup failed - cannot set up the LVT entry 0x%x on cpu %i\n", offset, smp_processor_id());
 no_offset:
 	*((int*)err) = -1;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,15,0)
 static void mask_ibs_lvt(void *err)
 {
 	u64 reg;
@@ -321,8 +587,9 @@ static void mask_ibs_lvt(void *err)
 
 fail:
 	*((int*)err) = -1;
-	pr_err("IBS ERROR: APIC setup failed - cannot mask the LVT entry #%i on cpu %i\n", offset, smp_processor_id());
+	pr_err("IBS: APIC setup failed - cannot mask the LVT entry #%i on cpu %i\n", offset, smp_processor_id());
 }
+#endif
 
 int setup_ibs_irq(void)
 {
@@ -344,18 +611,26 @@ out:
 
 void cleanup_ibs_irq(void)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+	restore_idt_entry();
+
+	pr_info("IBS: call to smp_spurious_interrupt has been correctly restored.\n");
+#else
 	int err = 0;
 
 	on_each_cpu(mask_ibs_lvt, &err, 1);
 
 	if (err)
-		pr_err("IBS ERROR: while masking the LVT, trying to restore the IDT\n");
+	{
+		pr_err("IBS: while masking the LVT, trying to restore the IDT.\n");
+	}
 
 	restore_idt_entry();
 
 	clear_bit(ibs_vector, used_vectors);
-	
-	pr_info("IBS: IRQ cleaned\n");
+
+	pr_info("IBS: IRQ cleaned.\n");
+#endif
 }
 
 
@@ -441,7 +716,7 @@ int setup_ibs_devices(void)
 	pcpu_op_dev = alloc_percpu(struct ibs_dev);
 	if (!pcpu_op_dev)
 	{
-		pr_err("IBS ERROR: failed to allocate IBS device metadata; exiting\n");
+		pr_err("IBS: failed to allocate IBS device metadata; exiting\n");
 		err = -ENOMEM;
 		goto out;
 	}
@@ -449,7 +724,7 @@ int setup_ibs_devices(void)
 	pcpu_fetch_dev = alloc_percpu(struct ibs_dev);
 	if (!pcpu_fetch_dev)
 	{
-		pr_err("IBS ERROR: failed to allocate IBS device metadata; exiting\n");
+		pr_err("IBS: failed to allocate IBS device metadata.\n");
 		err = -ENOMEM;
 		goto out_op_dev;
 	}
@@ -463,7 +738,7 @@ int setup_ibs_devices(void)
 	ibs_major = __register_chrdev(0, 0, NR_CPUS, "cpu/ibs", &ibs_fops);
 	if (ibs_major < 0)
 	{
-		pr_err("IBS ERROR: unable to retrieve IBS device number.\n");
+		pr_err("IBS: unable to retrieve IBS device number.\n");
 		err = -ENOMEM;
 		goto out_fetch_dev;
 	}
@@ -472,7 +747,7 @@ int setup_ibs_devices(void)
 	if (IS_ERR(ibs_class))
 	{
 		err = PTR_ERR(ibs_class);
-		pr_err("Failed to create IBS class; exiting\n");
+		pr_err("IBS: failed to create IBS class.\n");
 		goto out_chrdev;
 	}
 
@@ -788,11 +1063,18 @@ static __init int ibs_init(void)
 {
 	int err;
 
-	pr_info("IBS: starting module initialization\n");
+	pr_info("IBS: starting module initialization.\n");
 
 	err = check_for_ibs_support();
 	if (err)
 		goto out;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,11)
+	if(static_cpu_has(X86_FEATURE_PTI))
+	    pr_info("IBS: kernel page table isolation (PTI) is enabled.\n");
+	else
+	    pr_info("IBS: kernel page table isolation (PTI) is disabled.\n");
+#endif
 
 	err = setup_ibs_irq();
 	if (err)
@@ -801,6 +1083,8 @@ static __init int ibs_init(void)
 	err = setup_ibs_devices();
 	if (err)
 		goto out_ibs_irq;
+
+	pr_info("IBS: module initialization completed.\n");
 
 	goto out;
 
@@ -812,9 +1096,12 @@ out:
 
 static __exit void ibs_exit(void)
 {
+	pr_info("IBS: starting module finalization.\n");
+
 	cleanup_ibs_devices();
 	cleanup_ibs_irq();
-	pr_info("IBS: exited IBS module\n");
+
+	pr_info("IBS: module finalization completed.\n");
 }
 
 

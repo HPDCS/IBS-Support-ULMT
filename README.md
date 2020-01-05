@@ -6,10 +6,20 @@ This Linux kernel module is intended to provide the capability to perform *Contr
 
 This is the case of *pthreads* (POSIX Threads) which can register theirself to the device provided by this module in order to receive periodic---user-defined time interval---interrupts from IBS hardware support.
 
-To compile and install the module use the following commands:
-1. **make**
-2. **sudo insmod ibs_core.ko**
+## Compilation and Installation
 
-To remove the module and clean its directory use the following commands:
-1. **sudo rmmod ibs_core**
-2. **make clean**
+To compile and install the module, use the following commands:
+```sh
+>  make
+>  sudo insmod ibs_core.ko
+```
+
+To remove the module and clean the directory from object files, use the following commands:
+```sh
+>  sudo rmmod ibs_core
+>  make clean
+```
+
+## Hints
+
+Unless you are already using ULMT-based runtimes, such as the one included with <a href="https://github.com/HPDCS/ULMT-OpenMP-GCC">ULMT GNU OpenMP</a>, you have to code from scratch your own ULMT environemnt as well as the stub for registering/deregistering threads from IBS module.

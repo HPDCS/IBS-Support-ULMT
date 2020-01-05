@@ -4,6 +4,8 @@ The *User-Level-Micro-Thread* technology requires to be supported by both the ha
 
 This Linux kernel module is intended to provide the capability to perform *Control-Flow-Variation* of threads managed by the Linux operating system upon the occurrence of *Instruction-Based-Sampling* interrupts. This is achieved by giving control to a callback-function appositely registered by the threads that are carrying on the execution of ULMT-based application's tasks.
 
+This is the case of *pthreads* (POSIX Threads) which can register theirself to the device provided by this module in order to receive periodic---user-defined time interval---interrupt from IBS hardware support.
+
 To compile and install the module use the following commands:
 1. **make**
 2. **sudo insmod ibs_core.ko**

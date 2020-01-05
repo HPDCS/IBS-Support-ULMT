@@ -20,6 +20,6 @@ To remove the module and clean the directory from object files, use the followin
 >  make clean
 ```
 
-## Hints
+## Notice
 
 Unless you are already using ULMT-based runtimes, such as the one included with <a href="https://github.com/HPDCS/ULMT-OpenMP-GCC">ULMT GNU OpenMP</a>, you have to code from scratch your own ULMT environemnt as well as the stub for registering/deregistering threads from IBS module.

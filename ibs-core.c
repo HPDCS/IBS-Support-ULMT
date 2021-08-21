@@ -18,6 +18,8 @@
 #include <asm/uaccess.h>
 
 #include "ibs-api.h"
+#include "ibs-vtpmo.h"
+#include "ibs-disassemble.h"
 
 
 #define IBS_OP                      0
@@ -614,75 +616,214 @@ static inline long get_address_entry_idt(unsigned int vector)
 
 static inline int get_address_from_symbol(unsigned long *address, const char *symbol)
 {
+    int ret;
     struct kprobe kp = {};
 
     kp.symbol_name = symbol;
 
-    if (register_kprobe(&kp) < 0)
+    ret = register_kprobe(&kp);
+
+    if (ret < 0)
     {
-        pr_err("IBS: symbol %s not found.\n", symbol);
-        return -ENODATA;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,7)
+        pr_info("[IPI Module INFO] - Symbol %s not found. Returned value %d.\n", symbol, ret);
+        return ret;
+#else
+# ifdef CONFIG_KALLSYMS
+        unsigned long addr;
+        if ((addr = kallsyms_lookup_name(symbol)) == 0UL)
+        {
+# endif
+            pr_err("[IPI Module INFO] - Symbol %s not found. Returned value %d.\n", symbol, ret);
+            return ret;
+# ifdef CONFIG_KALLSYMS
+        }
+        else
+        {
+            *address = addr;
+        }
+# endif
+#endif
+    }
+    else
+    {
+        *address = (unsigned long) kp.addr;
+        unregister_kprobe(&kp);
     }
 
-    *address = (unsigned long) kp.addr;
-
-    unregister_kprobe(&kp);
-
-    pr_info("IBS: symbol %s is with the address 0x%lx.\n", symbol, *address);
+    pr_info("[IPI Module INFO] - Symbol %s found at 0x%lx.\n", symbol, *address);
 
     return 0;
 }
 #endif
 
+static unsigned long replace_call_address_through_binary_inspection(unsigned long entry_address, unsigned long spurious_address)
+{
+    unsigned int b;
+    unsigned int count;
+    unsigned int level = 0;
+    unsigned int level_0_call_count = 0;
+    
+    unsigned long cr0;
+
+    unsigned char disassembled[BUFFER_SIZE];
+
+    unsigned char *byte;
+    unsigned long level_address[MAX_LEVEL + 1] = { 0UL };
+
+    unsigned long address = 0UL;
+
+    if (spurious_address)
+    	pr_info("[IPI Module INFO] - Try to find the target CALL instruction with the knowledge obtained from source code analysis.\n");
+
+    if (sys_vtpmo(entry_address) != NO_MAP)
+    {
+        level_address[level] = entry_address;
+
+follow_the_flow:
+        byte = (unsigned char *) level_address[level];
+
+        for (b=0, count=0; b<SEQUENCE_MAX_BYTES; b+=count)
+        {
+            count = disassemble(&byte[b], SEQUENCE_MAX_BYTES - b, ((unsigned int) (((unsigned long) &byte[b]) & 0xffffffffUL)), disassembled);
+
+            if (byte[b] == 0xC2 || byte[b] == 0xC3 || byte[b] == 0xCA || byte[b] == 0xCB || byte[b] == 0xCF) // RET
+            {
+                if (level)
+                {
+                    level_address[level--] = 0UL;
+                    goto follow_the_flow;
+                }
+                else
+                	break;
+            }
+            else if (byte[b] == 0xE9 || byte[b] == 0xEA || byte[b] == 0xEB) // JMP
+            {
+                long jmp_address;
+
+                if ((jmp_address = resolve_jmp_address(&byte[b], count)) == 0)
+                	break;
+
+                if (sys_vtpmo(jmp_address) != NO_MAP)
+                {
+                    level_address[level] = *((unsigned long *) &jmp_address);
+                    goto follow_the_flow;
+                }
+                else
+                    break;
+            }
+            else if (byte[b] == 0x9A || byte[b] == 0xE8) // CALL
+            {
+                long call_address;
+
+                if ((call_address = resolve_call_address(&byte[b], count)) == 0)
+                	break;
+
+                if (spurious_address)
+                {
+                	/* Either symbols have been exported or the address
+                	   has been recovered via the kprobe service ... in
+                	   any case we know which is the operand to replace
+                	   within spurious irq-entry routine. */
+                	if (call_address == spurious_address)
+                	{
+                		old_call_operand = get_call_operand(&byte[b], count);
+						new_call_operand = (unsigned int) ((long) handle_ipi_irq - ((long) &byte[b+count]));
+						call_operand_address = (unsigned int *) &byte[b+1];
+
+						cr0 = _read_cr0();
+						_write_cr0(cr0 & ~X86_CR0_WP);
+
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
+						arch_cmpxchg(call_operand_address, old_call_operand, new_call_operand);
+#else
+						cmpxchg(call_operand_address, old_call_operand, new_call_operand);
+#endif
+
+						_write_cr0(cr0);
+
+						pr_info("[IPI Module INFO] - Address 0x%lx of the spurious interrupt handler is called at 0x%lx.\n", spurious_address, (long) &byte[b]);
+
+                        address = call_address;
+                        break;
+                	}
+                }
+                else if (level == 0)
+                {
+                    /* Symbols may also be non-exported, nor readable
+                       by kallsysm_lookup, but the entry_64.S source code
+                       doesn's lie ... the second CALL instruction encountered
+                       within the spurious irq-entry routine gives control to
+                       the spurious interrupt handler. */
+                    if ((++level_0_call_count) == 2)
+                    {
+                    	old_call_operand = get_call_operand(&byte[b], count);
+						new_call_operand = (unsigned int) ((long) handle_ipi_irq - ((long) &byte[b+count]));
+						call_operand_address = (unsigned int *) &byte[b+1];
+
+						cr0 = _read_cr0();
+						_write_cr0(cr0 & ~X86_CR0_WP);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
+						arch_cmpxchg(call_operand_address, old_call_operand, new_call_operand);
+#else
+						cmpxchg(call_operand_address, old_call_operand, new_call_operand);
+#endif
+
+						_write_cr0(cr0);
+
+						pr_info("[IPI Module INFO] - Address of the spurious interrupt handler (unknown symbol) is called at 0x%lx.\n", (long) &byte[b]);
+
+                        address = call_address;
+                        break;
+                    }
+                }
+
+                if (call_address)
+                {
+                    if (sys_vtpmo(call_address) != NO_MAP)
+                    {
+                        if (level < MAX_LEVEL)
+                        {
+                            level_address[level++] = (unsigned long) &byte[b + count];
+                            level_address[level] = *((unsigned long *) &call_address);
+                            goto follow_the_flow;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return address;
+}
+
 static int setup_idt_entry(void)
 {
-	unsigned long cr0;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
-	int i;
-	unsigned char *byte;
-	unsigned int operand;
 	unsigned long entry_spurious_address;
 	unsigned long smp_spurious_address;
-	unsigned long expected_smp_spurious_address;
 
 	if (!(entry_spurious_address = get_address_entry_idt(ibs_vector)))
 		return -ENODATA;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,8,0)
+	if (get_address_from_symbol(&smp_spurious_address, "sysvec_spurious_apic_interrupt"))
+#else
 	if (get_address_from_symbol(&smp_spurious_address, "smp_spurious_interrupt"))
-		return -ENODATA;
-
-	byte = (unsigned char *) entry_spurious_address;
-
-	for (i=0; i<512; i++)
+#endif
 	{
-		if (byte[i] == 0xE8)
-		{
-			operand = ((unsigned int) byte[i+1]) | (((unsigned int) byte[i+2]) << 8) |
-				(((unsigned int) byte[i+3]) << 16) | (((unsigned int) byte[i+4]) << 24);
-
-			expected_smp_spurious_address = (unsigned long) (((long) &byte[i+5]) + (long) operand);
-
-			if (expected_smp_spurious_address == smp_spurious_address)
-			{
-				old_call_operand = operand;
-				new_call_operand = (unsigned int) ((long) handle_ibs_irq - ((long) &byte[i+5]));
-				call_operand_address = (unsigned int *) &byte[i+1];
-
-				cr0 = _read_cr0();
-				_write_cr0(cr0 & ~X86_CR0_WP);
-
-# if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
-				arch_cmpxchg(call_operand_address, old_call_operand, new_call_operand);
-# else
-				cmpxchg(call_operand_address, old_call_operand, new_call_operand);
-# endif
-
-				_write_cr0(cr0);
-
-				return 0;
-			}
-		}
+// #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,7)
+		if (replace_call_address_through_binary_inspection(entry_spurious_address, 0UL))
+			return 0;
+// #endif
+		pr_err("IBS: Unable to find and replace the operand of the CALL instruction.\n");
+		return -ENODATA;
 	}
+
+	if (replace_call_address_through_binary_inspection(entry_spurious_address, smp_spurious_address))
+		return 0;
 
 	return -ENODATA;
 #else

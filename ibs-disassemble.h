@@ -5,7 +5,6 @@
 #define SEQUENCE_MAX_BYTES  4098
 #define BUFFER_SIZE         128
 
-extern const int NO_MAP;
 extern int sys_vtpmo(unsigned long vaddr);
 
 static long resolve_jmp_address(unsigned char *byte, unsigned int count)

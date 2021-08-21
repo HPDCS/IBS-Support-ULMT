@@ -728,7 +728,7 @@ follow_the_flow:
                 	if (call_address == spurious_address)
                 	{
                 		old_call_operand = get_call_operand(&byte[b], count);
-						new_call_operand = (unsigned int) ((long) handle_ipi_irq - ((long) &byte[b+count]));
+						new_call_operand = (unsigned int) ((long) handle_ibs_irq - ((long) &byte[b+count]));
 						call_operand_address = (unsigned int *) &byte[b+1];
 
 						cr0 = _read_cr0();
@@ -759,7 +759,7 @@ follow_the_flow:
                     if ((++level_0_call_count) == 2)
                     {
                     	old_call_operand = get_call_operand(&byte[b], count);
-						new_call_operand = (unsigned int) ((long) handle_ipi_irq - ((long) &byte[b+count]));
+						new_call_operand = (unsigned int) ((long) handle_ibs_irq - ((long) &byte[b+count]));
 						call_operand_address = (unsigned int *) &byte[b+1];
 
 						cr0 = _read_cr0();

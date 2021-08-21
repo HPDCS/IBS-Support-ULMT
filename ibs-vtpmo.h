@@ -12,6 +12,8 @@
 #define PDE(addr)  (((long long)(addr) >> 21) & 0x1ff)
 #define PTE(addr)  (((long long)(addr) >> 12) & 0x1ff)
 
+const int NO_MAP = -1;
+
 static int sys_vtpmo(unsigned long vaddr)
 {
 	void* target_address;

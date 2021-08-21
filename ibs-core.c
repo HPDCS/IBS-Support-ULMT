@@ -28,6 +28,7 @@
 /*                             (check IBS support)                              */
 
 #define CPUID_AMD_FAM10h            0x10
+#define CPUID_AMD_FAM17h            0x17
 
 #define CPUID_Fn8000_001B_EAX       cpuid_eax(0x8000001B)
 #define  IBS_CPUID_IBSFFV           1ULL
@@ -91,6 +92,9 @@ static unsigned ibs_vector = NR_VECTORS-1;
 
 static int ibs_op_supported;
 static int ibs_fetch_supported;
+
+static int workaround_fam10h_err_420 = 0;
+static int workaround_fam17h_zn = 0;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
 static unsigned int old_call_operand = 0x0;
@@ -165,16 +169,53 @@ int check_for_ibs_support(void)
 		return -EINVAL;
 	}
 
-	if (c->x86 != CPUID_AMD_FAM10h)
-	{
-		pr_err("IBS: this module is designed only for Fam 10h\n");
-		return -EINVAL;
-	}
+	feature_id = CPUID_Fn8000_0001_ECX;
 
-	if (!(CPUID_Fn8000_0001_ECX & IBS_SUPPORT_EXIST))
+	if (c->x86 == CPUID_AMD_FAM10h)
 	{
-		pr_err("IBS: CPUID_Fn8000_0001 indicates no IBS support\n");
-		return -EINVAL;	
+		if (!(feature_id & IBS_SUPPORT_EXIST))
+		{
+			pr_err("IBS: CPUID_Fn8000_0001 indicates no IBS support\n");
+			return -EINVAL;	
+		}
+		else
+		{
+			pr_info("IBS: Startup enabling workaround for Family 10h CPUs\n");
+			workaround_fam10h_err_420 = 1;
+		}
+	}
+	else if (c->x86 == CPUID_AMD_FAM17h)
+	{
+		if (!(feature_id & IBS_SUPPORT_EXIST))
+		{
+			if ((c->x86_model >= 0x0 && c->x86_model <= 0x2f) || (c->x86_model >= 0x50 && c->x86_model < 0x5f))
+			{
+				unsigned int cpu = 0;
+
+				pr_info("IBS: Startup enabling workaround for Family 17h first-gen CPUs\n");
+				workaround_fam17h_zn = 1;
+
+				for_each_online_cpu(cpu)
+				{
+					start_fam17h_zn_static_workaround(cpu);
+				}
+			}
+			else
+			{
+				pr_err("IBS: CPUID_Fn8000_0001 indicates no IBS support\n");
+				return -EINVAL;	
+			}
+		}
+		else
+		{
+			pr_info("IBS: Startup enabling workaround for Family 17h first-gen CPUs\n");
+			workaround_fam17h_zn = 1;
+		}
+	}
+	else
+	{
+		pr_err("IBS: this module is designed only for Fam 10h and 17h\n");
+		return -EINVAL;
 	}
 
 	feature_id = CPUID_Fn8000_001B_EAX;

@@ -1,4 +1,5 @@
 #include <linux/types.h>
+#include <linux/cpu.h>
 #include <linux/smp.h>
 #include <linux/percpu.h>
 #include <linux/sched.h>
@@ -29,6 +30,18 @@
 
 #define CPUID_AMD_FAM10h            0x10
 #define CPUID_AMD_FAM17h            0x17
+
+#define FAM17H_MSR_WA_1				0xc0011020
+#define FAM17H_MSR_WA_1_BITS		0x40000000000000ULL
+#define FAM17H_MSR_WA_2				0xc0011029
+#define FAM17H_MSR_WA_2_BITS		0x80000ULL
+#define FAM17H_MSR_WA_3				0xc0010296
+#define FAM17H_MSR_WA_3_BITS		0x404040ULL
+#define CPUID_EXT_FEATURES			0xc0011005
+
+#ifndef topology_sibling_cpumask
+#define topology_sibling_cpumask(cpu)	(per_cpu(cpu_sibling_map, cpu))
+#endif
 
 #define CPUID_Fn8000_001B_EAX       cpuid_eax(0x8000001B)
 #define  IBS_CPUID_IBSFFV           1ULL
@@ -96,6 +109,15 @@ static int ibs_fetch_supported;
 static int workaround_fam10h_err_420 = 0;
 static int workaround_fam17h_zn = 0;
 
+static int workarounds_started = 0;
+
+static int* pcpu_num_devices_enabled;
+static spinlock_t * pcpu_workaround_lock;
+
+static u64 fam17h_old_1 = 0;
+static u64 fam17h_old_2 = 0;
+static u64 fam17h_old_3 = 0;
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
 static unsigned int old_call_operand = 0x0;
 static unsigned int new_call_operand = 0x0;
@@ -156,6 +178,170 @@ asm(
 #endif
 
 
+static inline u64 custom_rdmsrl_on_cpu(unsigned int cpu, u32 msr_no)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
+	u64 ret_val;
+	rdmsrl_on_cpu(cpu, msr_no, &ret_val);
+	return ret_val;
+#else
+	u32 lo, hi;
+	rdmsr_on_cpu(cpu, msr_no, &lo, &hi);
+	return (u64)lo | ((u64)hi << 32ULL);
+#endif
+}
+
+static inline void custom_wrmsrl_on_cpu(unsigned int cpu, u32 msr_no, u64 val)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
+	wrmsrl_on_cpu(cpu, msr_no, val);
+#else
+	u32 lo, hi;
+	lo = val & 0xffffffff;
+	hi = val >> 32;
+	wrmsr_on_cpu(cpu, msr_no, lo, hi);
+#endif
+}
+
+static void init_fam17h_zn_workaround(void)
+{
+	rdmsrl(FAM17H_MSR_WA_1, fam17h_old_1);
+	rdmsrl(FAM17H_MSR_WA_2, fam17h_old_2);
+	rdmsrl(FAM17H_MSR_WA_3, fam17h_old_3);
+}
+
+static int init_workaround_structs(void)
+{
+	struct cpuinfo_x86 *c;
+
+	if (workarounds_started)
+		return 0;
+
+	c = &boot_cpu_data;
+
+	if (c->x86_vendor == X86_VENDOR_AMD && c->x86 == CPUID_AMD_FAM17h && c->x86_model == 0x1)
+	{
+		init_fam17h_zn_workaround();
+	}
+
+	pcpu_num_devices_enabled = alloc_percpu(int);
+	if (!pcpu_num_devices_enabled)
+		return -1;
+
+	pcpu_workaround_lock = alloc_percpu(spinlock_t);
+	if (!pcpu_workaround_lock)
+	{
+		free_percpu(pcpu_num_devices_enabled);
+		return -1;
+	}
+
+	workarounds_started = 1;
+
+	return 0;
+}
+
+static void free_workaround_structs(void)
+{
+	if (workarounds_started)
+	{
+		free_percpu(pcpu_num_devices_enabled);
+		free_percpu(pcpu_workaround_lock);
+	}
+}
+
+static void init_workaround_initialize(void)
+{
+	unsigned int cpu;
+
+	if (!workarounds_started)
+		return;
+
+	cpu = 0;
+
+	for_each_possible_cpu(cpu)
+	{
+		spinlock_t *workaround_lock;
+		int *num_devs = per_cpu_ptr(pcpu_num_devices_enabled, cpu);
+
+		*num_devs = 0;
+
+		workaround_lock = per_cpu_ptr(pcpu_workaround_lock, cpu);
+
+		spin_lock_init(workaround_lock);
+	}
+}
+
+static void start_fam17h_zn_static_workaround(const int cpu)
+{
+	u64 cur;
+	int cpu_to_offline = -1, cpu_to_online = -1;
+
+	if (!workarounds_started)
+	{
+		init_workaround_structs();
+		init_workaround_initialize();
+	}
+
+	cur = custom_rdmsrl_on_cpu(cpu, CPUID_EXT_FEATURES);
+	cur |= (1ULL << 42);
+	custom_wrmsrl_on_cpu(cpu, CPUID_EXT_FEATURES, cur);
+
+	cur = custom_rdmsrl_on_cpu(cpu, FAM17H_MSR_WA_2);
+
+	if (cur & FAM17H_MSR_WA_2_BITS)
+		return;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
+	for_each_cpu(cpu_to_offline, topology_sibling_cpumask(cpu))
+#else
+	for_each_cpu_mask(cpu_to_offline, topology_core_siblings(cpu))
+#endif
+	{
+		if (cpu_to_offline != cpu)
+		{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
+			remove_cpu(cpu_to_offline);
+#else
+			cpu_down(cpu_to_offline);
+#endif
+			cpu_to_online = cpu_to_offline;
+		}
+	}
+
+	custom_wrmsrl_on_cpu(cpu, FAM17H_MSR_WA_2, (cur | FAM17H_MSR_WA_2_BITS));
+	if (cpu_to_online != -1)
+	{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
+		add_cpu(cpu_to_online);
+#else
+		cpu_up(cpu_to_online);
+#endif
+	}
+}
+
+static void stop_fam17h_zn_static_workaround(const int cpu)
+{
+	u64 cur;
+	unsigned int cpu_to_use;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
+	cpu_to_use = cpumask_first(topology_sibling_cpumask(cpu));
+#else
+	cpu_to_use = first_cpu(topology_core_siblings(cpu));
+#endif
+
+	if (cpu_to_use == cpu)
+	{
+		cur = custom_rdmsrl_on_cpu(cpu_to_use, FAM17H_MSR_WA_2);
+		cur = fam17h_old_2 | (cur & ~FAM17H_MSR_WA_2_BITS);
+		custom_wrmsrl_on_cpu(cpu, FAM17H_MSR_WA_2, cur);
+	}
+
+	cur = custom_rdmsrl_on_cpu(cpu, CPUID_EXT_FEATURES);
+	cur &= ~(1ULL << 42);
+	custom_wrmsrl_on_cpu(cpu, CPUID_EXT_FEATURES, cur);
+}
+
 int check_for_ibs_support(void)
 {
 	struct cpuinfo_x86 *c;
@@ -205,11 +391,6 @@ int check_for_ibs_support(void)
 				pr_err("IBS: CPUID_Fn8000_0001 indicates no IBS support\n");
 				return -EINVAL;	
 			}
-		}
-		else
-		{
-			pr_info("IBS: Startup enabling workaround for Family 17h first-gen CPUs\n");
-			workaround_fam17h_zn = 1;
 		}
 	}
 	else
@@ -770,10 +951,18 @@ int setup_ibs_devices(void)
 		goto out_op_dev;
 	}
 
+	if (init_workaround_structs())
+	{
+		pr_err("Failed to allocate IBS device metadata; exiting\n");
+		err = -ENOMEM;
+		goto out_fetch_dev;
+	}
+
 	for_each_possible_cpu(cpu)
 	{
 		init_ibs_dev(per_cpu_ptr(pcpu_op_dev, cpu), cpu, IBS_OP);
 		init_ibs_dev(per_cpu_ptr(pcpu_fetch_dev, cpu), cpu, IBS_FETCH);
+		init_workaround_initialize();
 	}
 
 	ibs_major = __register_chrdev(0, 0, NR_CPUS, "cpu/ibs", &ibs_fops);
@@ -819,8 +1008,113 @@ out:
 	return err;
 }
 
+static void enable_fam17h_zn_dyn_workaround(const int cpu)
+{
+	__u64 set_bits;
+	__u64 op_ctl, fetch_ctl;
+	__u64 cur1, cur3;
+
+	unsigned int cpu_to_use = 0;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
+	for_each_cpu(cpu_to_use, topology_sibling_cpumask(cpu))
+#else
+	for_each_cpu_mask(cpu_to_use, topology_core_siblings(cpu))
+#endif
+	{
+		op_ctl = custom_rdmsrl_on_cpu(cpu_to_use, MSR_IBS_OP_CTL);
+		fetch_ctl = custom_rdmsrl_on_cpu(cpu_to_use, MSR_IBS_FETCH_CTL);
+
+		if ((op_ctl & IBS_OP_EN) || (fetch_ctl & IBS_FETCH_EN))
+			return;
+	}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
+	cpu_to_use = cpumask_first(topology_sibling_cpumask(cpu));
+#else
+	cpu_to_use = first_cpu(topology_core_siblings(cpu));
+#endif
+
+	cur1 = custom_rdmsrl_on_cpu(cpu_to_use, FAM17H_MSR_WA_1);
+	cur3 = custom_rdmsrl_on_cpu(cpu_to_use, FAM17H_MSR_WA_3);
+
+	set_bits = cur1 | FAM17H_MSR_WA_1_BITS;
+	custom_wrmsrl_on_cpu(cpu_to_use, FAM17H_MSR_WA_1, set_bits);
+
+	set_bits = cur3 & ~FAM17H_MSR_WA_3_BITS;
+	custom_wrmsrl_on_cpu(cpu_to_use, FAM17H_MSR_WA_3, set_bits);
+}
+
+static void disable_fam17h_zn_dyn_workaround(const int cpu)
+{
+	__u64 op_ctl, fetch_ctl;
+	__u64 cur1, cur3, set_bits;
+
+	unsigned int cpu_to_use = 0;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
+	for_each_cpu(cpu_to_use, topology_sibling_cpumask(cpu))
+#else
+	for_each_cpu_mask(cpu_to_use, topology_core_siblings(cpu))
+#endif
+	{
+		op_ctl = custom_rdmsrl_on_cpu(cpu_to_use, MSR_IBS_OP_CTL);
+		fetch_ctl = custom_rdmsrl_on_cpu(cpu_to_use, MSR_IBS_FETCH_CTL);
+
+		if ((op_ctl & IBS_OP_EN) || (fetch_ctl & IBS_FETCH_EN))
+			return;
+	}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
+	cpu_to_use = cpumask_first(topology_sibling_cpumask(cpu));
+#else
+	cpu_to_use = first_cpu(topology_core_siblings(cpu));
+#endif
+
+	cur1 = custom_rdmsrl_on_cpu(cpu_to_use, FAM17H_MSR_WA_1);
+	cur3 = custom_rdmsrl_on_cpu(cpu_to_use, FAM17H_MSR_WA_3);
+
+	set_bits = cur1 & ~FAM17H_MSR_WA_1_BITS;
+	set_bits |= fam17h_old_1;
+	custom_wrmsrl_on_cpu(cpu_to_use, FAM17H_MSR_WA_1, set_bits);
+
+	set_bits = cur3 | FAM17H_MSR_WA_3_BITS;
+	set_bits |= fam17h_old_3;
+	custom_wrmsrl_on_cpu(cpu_to_use, FAM17H_MSR_WA_3, set_bits);
+}
+
+static void start_fam17h_zn_dyn_workaround(const int cpu)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
+	int cpu_to_use = cpumask_first(topology_sibling_cpumask(cpu));
+#else
+	int cpu_to_use = first_cpu(topology_core_siblings(cpu));
+#endif
+	spinlock_t *cpu_workaround_lock = per_cpu_ptr(pcpu_workaround_lock, cpu_to_use);
+
+	spin_lock(cpu_workaround_lock);
+	enable_fam17h_zn_dyn_workaround(cpu);
+	spin_unlock(cpu_workaround_lock);
+}
+
+static void stop_fam17h_zn_dyn_workaround(const int cpu)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
+	int cpu_to_use = cpumask_first(topology_sibling_cpumask(cpu));
+#else
+	int cpu_to_use = first_cpu(topology_core_siblings(cpu));
+#endif
+	spinlock_t *cpu_workaround_lock = per_cpu_ptr(pcpu_workaround_lock, cpu_to_use);
+
+	spin_lock(cpu_workaround_lock);
+	disable_fam17h_zn_dyn_workaround(cpu);
+	spin_unlock(cpu_workaround_lock);
+}
+
 static inline void enable_ibs_op_on_cpu(struct ibs_dev *dev, const int cpu, const u64 op_ctl)
 {
+	if (workaround_fam17h_zn)
+		start_fam17h_zn_dyn_workaround(cpu);
     wrmsrl_on_cpu(cpu, MSR_IBS_OP_CTL, op_ctl);
 }
 
@@ -841,18 +1135,25 @@ static void disable_ibs_op(void *info)
 
 static void disable_ibs_op_on_cpu(struct ibs_dev *dev, const int cpu)
 {
-    do_fam10h_workaround_420(cpu);
+	if (workaround_fam10h_err_420)
+    	do_fam10h_workaround_420(cpu);
 	smp_call_function_single(cpu, disable_ibs_op, NULL, 1);
+	if (workaround_fam17h_zn)
+		stop_fam17h_zn_dyn_workaround(cpu);
 }
 
 static inline void enable_ibs_fetch_on_cpu(struct ibs_dev *dev, const int cpu, const u64 fetch_ctl)
 {
+	if (workaround_fam17h_zn)
+		start_fam17h_zn_dyn_workaround(cpu);
     wrmsrl_on_cpu(cpu, MSR_IBS_FETCH_CTL, fetch_ctl);
 }
 
 static void disable_ibs_fetch_on_cpu(struct ibs_dev *dev, const int cpu)
 {
     wrmsrl_on_cpu(cpu, MSR_IBS_FETCH_CTL, 0ULL);
+    if (workaround_fam17h_zn)
+		stop_fam17h_zn_dyn_workaround(cpu);
 }
 
 void cleanup_ibs_devices(void)
@@ -873,8 +1174,18 @@ void cleanup_ibs_devices(void)
 
 	__unregister_chrdev(ibs_major, 0, NR_CPUS, "cpu/ibs");
 
+	cpu = 0;
+	
+	for_each_possible_cpu(cpu)
+	{
+		if (workaround_fam17h_zn)
+			stop_fam17h_zn_static_workaround(cpu);
+	}
+
 	free_percpu(pcpu_fetch_dev);
 	free_percpu(pcpu_op_dev);
+
+	free_workaround_structs();
 
 	class_destroy(ibs_class);
 }
@@ -1050,13 +1361,16 @@ void handle_ibs_irq(struct pt_regs *regs)
 	dev = this_cpu_ptr(pcpu_op_dev);
 
 	/* AMD family 10th workaround. */
-	rdmsrl(MSR_IBS_OP_CTL, tmp);
-	if (!(tmp & IBS_OP_MAX_CNT_MAX))
+	if (workaround_fam10h_err_420)
 	{
-		wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
-		apic->write(APIC_EOI, APIC_EOI_ACK);
-		preempt_enable();
-		return;
+		rdmsrl(MSR_IBS_OP_CTL, tmp);
+		if (!(tmp & IBS_OP_MAX_CNT_MAX))
+		{
+			wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
+			apic->write(APIC_EOI, APIC_EOI_ACK);
+			preempt_enable();
+			return;
+		}
 	}
 
 	/* This is a kernel thread. */

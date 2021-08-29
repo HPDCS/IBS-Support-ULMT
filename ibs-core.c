@@ -833,6 +833,7 @@ static int setup_idt_entry(void)
 #else
 	struct desc_ptr idtr;
 	gate_desc ibs_desc;
+	unsigned long cr0;
 
 	store_idt(&idtr);
 

@@ -18,8 +18,10 @@
 #include <asm/uaccess.h>
 
 #include "ibs-api.h"
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
 #include "ibs-vtpmo.h"
 #include "ibs-disassemble.h"
+#endif
 
 
 #define IBS_OP                      0
@@ -657,6 +659,7 @@ static inline int get_address_from_symbol(unsigned long *address, const char *sy
 }
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
 static unsigned long replace_call_address_through_binary_inspection(unsigned long entry_address, unsigned long spurious_address)
 {
     unsigned int b;
@@ -798,6 +801,7 @@ follow_the_flow:
 
     return address;
 }
+#endif
 
 static int setup_idt_entry(void)
 {
@@ -1103,6 +1107,8 @@ int setup_ibs_devices(void)
 	{
 		init_ibs_dev(per_cpu_ptr(pcpu_op_dev, cpu), cpu, IBS_OP);
 		init_ibs_dev(per_cpu_ptr(pcpu_fetch_dev, cpu), cpu, IBS_FETCH);
+		/* This is a BUG into the AMB IBS Toolkit. Workaround initialization
+		   should be placed out of the braces, after this statement. */
 		init_workaround_initialize();
 	}
 

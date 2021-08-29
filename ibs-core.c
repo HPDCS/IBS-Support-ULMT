@@ -604,133 +604,133 @@ static inline void _write_cr0(unsigned long val)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
 static inline long get_address_entry_idt(unsigned int vector)
 {
-    struct desc_ptr idtr;
-    gate_desc *gate_ptr;
+	struct desc_ptr idtr;
+	gate_desc *gate_ptr;
 
-    store_idt(&idtr);
+	store_idt(&idtr);
 
-    gate_ptr = (gate_desc *) (idtr.address + vector * sizeof(gate_desc));
+	gate_ptr = (gate_desc *) (idtr.address + vector * sizeof(gate_desc));
 
-    return (long) ((unsigned long) (gate_ptr->offset_low) |
-    				((unsigned long) (gate_ptr->offset_middle) << 16) |
-    					((unsigned long) (gate_ptr->offset_high) << 32));
+	return (long) ((unsigned long) (gate_ptr->offset_low) |
+					((unsigned long) (gate_ptr->offset_middle) << 16) |
+						((unsigned long) (gate_ptr->offset_high) << 32));
 }
 
 static inline int get_address_from_symbol(unsigned long *address, const char *symbol)
 {
-    int ret;
-    struct kprobe kp = {};
+	int ret;
+	struct kprobe kp = {};
 
-    kp.symbol_name = symbol;
+	kp.symbol_name = symbol;
 
-    ret = register_kprobe(&kp);
+	ret = register_kprobe(&kp);
 
-    if (ret < 0)
-    {
+	if (ret < 0)
+	{
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,7)
-        pr_info("[IPI Module INFO] - Symbol %s not found. Returned value %d.\n", symbol, ret);
-        return ret;
+		pr_info("[IPI Module INFO] - Symbol %s not found. Returned value %d.\n", symbol, ret);
+		return ret;
 #else
 # ifdef CONFIG_KALLSYMS
-        unsigned long addr;
-        if ((addr = kallsyms_lookup_name(symbol)) == 0UL)
-        {
+		unsigned long addr;
+		if ((addr = kallsyms_lookup_name(symbol)) == 0UL)
+		{
 # endif
-            pr_err("[IPI Module INFO] - Symbol %s not found. Returned value %d.\n", symbol, ret);
-            return ret;
+			pr_err("[IPI Module INFO] - Symbol %s not found. Returned value %d.\n", symbol, ret);
+			return ret;
 # ifdef CONFIG_KALLSYMS
-        }
-        else
-        {
-            *address = addr;
-        }
+		}
+		else
+		{
+			*address = addr;
+		}
 # endif
 #endif
-    }
-    else
-    {
-        *address = (unsigned long) kp.addr;
-        unregister_kprobe(&kp);
-    }
+	}
+	else
+	{
+		*address = (unsigned long) kp.addr;
+		unregister_kprobe(&kp);
+	}
 
-    pr_info("[IPI Module INFO] - Symbol %s found at 0x%lx.\n", symbol, *address);
+	pr_info("[IPI Module INFO] - Symbol %s found at 0x%lx.\n", symbol, *address);
 
-    return 0;
+	return 0;
 }
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
 static unsigned long replace_call_address_through_binary_inspection(unsigned long entry_address, unsigned long spurious_address)
 {
-    unsigned int b;
-    unsigned int count;
-    unsigned int level = 0;
-    unsigned int level_0_call_count = 0;
-    
-    unsigned long cr0;
+	unsigned int b;
+	unsigned int count;
+	unsigned int level = 0;
+	unsigned int level_0_call_count = 0;
+	
+	unsigned long cr0;
 
-    unsigned char disassembled[BUFFER_SIZE];
+	unsigned char disassembled[BUFFER_SIZE];
 
-    unsigned char *byte;
-    unsigned long level_address[MAX_LEVEL + 1] = { 0UL };
+	unsigned char *byte;
+	unsigned long level_address[MAX_LEVEL + 1] = { 0UL };
 
-    unsigned long address = 0UL;
+	unsigned long address = 0UL;
 
-    if (spurious_address)
-    	pr_info("[IPI Module INFO] - Try to find the target CALL instruction with the knowledge obtained from source code analysis.\n");
+	if (spurious_address)
+		pr_info("[IPI Module INFO] - Try to find the target CALL instruction with the knowledge obtained from source code analysis.\n");
 
-    if (sys_vtpmo(entry_address) != NO_MAP)
-    {
-        level_address[level] = entry_address;
+	if (sys_vtpmo(entry_address) != NO_MAP)
+	{
+		level_address[level] = entry_address;
 
 follow_the_flow:
-        byte = (unsigned char *) level_address[level];
+		byte = (unsigned char *) level_address[level];
 
-        for (b=0, count=0; b<SEQUENCE_MAX_BYTES; b+=count)
-        {
-            count = disassemble(&byte[b], SEQUENCE_MAX_BYTES - b, ((unsigned int) (((unsigned long) &byte[b]) & 0xffffffffUL)), disassembled);
+		for (b=0, count=0; b<SEQUENCE_MAX_BYTES; b+=count)
+		{
+			count = disassemble(&byte[b], SEQUENCE_MAX_BYTES - b, ((unsigned int) (((unsigned long) &byte[b]) & 0xffffffffUL)), disassembled);
 
-            if (byte[b] == 0xC2 || byte[b] == 0xC3 || byte[b] == 0xCA || byte[b] == 0xCB || byte[b] == 0xCF) // RET
-            {
-                if (level)
-                {
-                    level_address[level--] = 0UL;
-                    goto follow_the_flow;
-                }
-                else
-                	break;
-            }
-            else if (byte[b] == 0xE9 || byte[b] == 0xEA || byte[b] == 0xEB) // JMP
-            {
-                long jmp_address;
+			if (byte[b] == 0xC2 || byte[b] == 0xC3 || byte[b] == 0xCA || byte[b] == 0xCB || byte[b] == 0xCF) // RET
+			{
+				if (level)
+				{
+					level_address[level--] = 0UL;
+					goto follow_the_flow;
+				}
+				else
+					break;
+			}
+			else if (byte[b] == 0xE9 || byte[b] == 0xEA || byte[b] == 0xEB) // JMP
+			{
+				long jmp_address;
 
-                if ((jmp_address = resolve_jmp_address(&byte[b], count)) == 0)
-                	break;
+				if ((jmp_address = resolve_jmp_address(&byte[b], count)) == 0)
+					break;
 
-                if (sys_vtpmo(jmp_address) != NO_MAP)
-                {
-                    level_address[level] = *((unsigned long *) &jmp_address);
-                    goto follow_the_flow;
-                }
-                else
-                    break;
-            }
-            else if (byte[b] == 0x9A || byte[b] == 0xE8) // CALL
-            {
-                long call_address;
+				if (sys_vtpmo(jmp_address) != NO_MAP)
+				{
+					level_address[level] = *((unsigned long *) &jmp_address);
+					goto follow_the_flow;
+				}
+				else
+					break;
+			}
+			else if (byte[b] == 0x9A || byte[b] == 0xE8) // CALL
+			{
+				long call_address;
 
-                if ((call_address = resolve_call_address(&byte[b], count)) == 0)
-                	break;
+				if ((call_address = resolve_call_address(&byte[b], count)) == 0)
+					break;
 
-                if (spurious_address)
-                {
-                	/* Either symbols have been exported or the address
-                	   has been recovered via the kprobe service ... in
-                	   any case we know which is the operand to replace
-                	   within spurious irq-entry routine. */
-                	if (call_address == spurious_address)
-                	{
-                		old_call_operand = get_call_operand(&byte[b], count);
+				if (spurious_address)
+				{
+					/* Either symbols have been exported or the address
+					   has been recovered via the kprobe service ... in
+					   any case we know which is the operand to replace
+					   within spurious irq-entry routine. */
+					if (call_address == spurious_address)
+					{
+						old_call_operand = get_call_operand(&byte[b], count);
 						new_call_operand = (unsigned int) ((long) handle_ibs_irq - ((long) &byte[b+count]));
 						call_operand_address = (unsigned int *) &byte[b+1];
 
@@ -748,20 +748,20 @@ follow_the_flow:
 
 						pr_info("[IPI Module INFO] - Address 0x%lx of the spurious interrupt handler is called at 0x%lx.\n", spurious_address, (long) &byte[b]);
 
-                        address = call_address;
-                        break;
-                	}
-                }
-                else if (level == 0)
-                {
-                    /* Symbols may also be non-exported, nor readable
-                       by kallsysm_lookup, but the entry_64.S source code
-                       doesn's lie ... the second CALL instruction encountered
-                       within the spurious irq-entry routine gives control to
-                       the spurious interrupt handler. */
-                    if ((++level_0_call_count) == 2)
-                    {
-                    	old_call_operand = get_call_operand(&byte[b], count);
+						address = call_address;
+						break;
+					}
+				}
+				else if (level == 0)
+				{
+					/* Symbols may also be non-exported, nor readable
+					   by kallsysm_lookup, but the entry_64.S source code
+					   doesn's lie ... the second CALL instruction encountered
+					   within the spurious irq-entry routine gives control to
+					   the spurious interrupt handler. */
+					if ((++level_0_call_count) == 2)
+					{
+						old_call_operand = get_call_operand(&byte[b], count);
 						new_call_operand = (unsigned int) ((long) handle_ibs_irq - ((long) &byte[b+count]));
 						call_operand_address = (unsigned int *) &byte[b+1];
 
@@ -778,28 +778,28 @@ follow_the_flow:
 
 						pr_info("[IPI Module INFO] - Address of the spurious interrupt handler (unknown symbol) is called at 0x%lx.\n", (long) &byte[b]);
 
-                        address = call_address;
-                        break;
-                    }
-                }
+						address = call_address;
+						break;
+					}
+				}
 
-                if (call_address)
-                {
-                    if (sys_vtpmo(call_address) != NO_MAP)
-                    {
-                        if (level < MAX_LEVEL)
-                        {
-                            level_address[level++] = (unsigned long) &byte[b + count];
-                            level_address[level] = *((unsigned long *) &call_address);
-                            goto follow_the_flow;
-                        }
-                    }
-                }
-            }
-        }
-    }
+				if (call_address)
+				{
+					if (sys_vtpmo(call_address) != NO_MAP)
+					{
+						if (level < MAX_LEVEL)
+						{
+							level_address[level++] = (unsigned long) &byte[b + count];
+							level_address[level] = *((unsigned long *) &call_address);
+							goto follow_the_flow;
+						}
+					}
+				}
+			}
+		}
+	}
 
-    return address;
+	return address;
 }
 #endif
 
@@ -818,10 +818,10 @@ static int setup_idt_entry(void)
 	if (get_address_from_symbol(&smp_spurious_address, "smp_spurious_interrupt"))
 #endif
 	{
-// #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,7)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,7)
 		if (replace_call_address_through_binary_inspection(entry_spurious_address, 0UL))
 			return 0;
-// #endif
+#endif
 		pr_err("IBS: Unable to find and replace the operand of the CALL instruction.\n");
 		return -ENODATA;
 	}
@@ -1007,20 +1007,20 @@ void cleanup_ibs_irq(void)
 /*                    (structures, variables and functions)                     */
 
 struct ibs_dev {
-	u64 ctl;                      /* Copy of op/fetch ctl MSR to store control options. */
-	struct mutex ctl_lock;        /* Lock for device control options. */
+	u64 ctl;						/* Copy of op/fetch ctl MSR to store control options. */
+	struct mutex ctl_lock;			/* Lock for device control options. */
 
-	int ibs_thread;               /* ID of threads registered to this device. */
-	unsigned long ibs_callback;   /* Callback functions to give control for each registered thread. */
+	int ibs_thread;					/* ID of threads registered to this device. */
+	unsigned long ibs_callback;		/* Callback functions to give control for each registered thread. */
 	unsigned long safe_stack_ptr;	/* Points to the base of the safe alternate stack. */
 	unsigned long safe_mem_addr;	/* Memory area where safety make CFV */
 	size_t safe_mem_size;			/* Size of safe memory area */
-	unsigned long text_start;     /* Program's text section start address. */
-	unsigned long text_end;       /* Program's text section end address. */
+	unsigned long text_start;		/* Program's text section start address. */
+	unsigned long text_end;			/* Program's text section end address. */
 
-	int cpu;                      /* This device's CPU-ID. */
-	int flavor;                   /* IBS_FETCH or IBS_OP. */
-	atomic_t in_use;              /* Non-Zero when device is open. */
+	int cpu;						/* This device's CPU-ID. */
+	int flavor;						/* IBS_FETCH or IBS_OP. */
+	atomic_t in_use;				/* Non-Zero when device is open. */
 };
 
 static const struct file_operations ibs_fops = {
@@ -1269,7 +1269,7 @@ static inline void enable_ibs_op_on_cpu(struct ibs_dev *dev, const int cpu, cons
 {
 	if (workaround_fam17h_zn)
 		start_fam17h_zn_dyn_workaround(cpu);
-    wrmsrl_on_cpu(cpu, MSR_IBS_OP_CTL, op_ctl);
+	wrmsrl_on_cpu(cpu, MSR_IBS_OP_CTL, op_ctl);
 }
 
 static void do_fam10h_workaround_420(const int cpu)
@@ -1290,7 +1290,7 @@ static void disable_ibs_op(void *info)
 static void disable_ibs_op_on_cpu(struct ibs_dev *dev, const int cpu)
 {
 	if (workaround_fam10h_err_420)
-    	do_fam10h_workaround_420(cpu);
+		do_fam10h_workaround_420(cpu);
 	smp_call_function_single(cpu, disable_ibs_op, NULL, 1);
 	if (workaround_fam17h_zn)
 		stop_fam17h_zn_dyn_workaround(cpu);
@@ -1300,13 +1300,13 @@ static inline void enable_ibs_fetch_on_cpu(struct ibs_dev *dev, const int cpu, c
 {
 	if (workaround_fam17h_zn)
 		start_fam17h_zn_dyn_workaround(cpu);
-    wrmsrl_on_cpu(cpu, MSR_IBS_FETCH_CTL, fetch_ctl);
+	wrmsrl_on_cpu(cpu, MSR_IBS_FETCH_CTL, fetch_ctl);
 }
 
 static void disable_ibs_fetch_on_cpu(struct ibs_dev *dev, const int cpu)
 {
-    wrmsrl_on_cpu(cpu, MSR_IBS_FETCH_CTL, 0ULL);
-    if (workaround_fam17h_zn)
+	wrmsrl_on_cpu(cpu, MSR_IBS_FETCH_CTL, 0ULL);
+	if (workaround_fam17h_zn)
 		stop_fam17h_zn_dyn_workaround(cpu);
 }
 
@@ -1560,12 +1560,12 @@ void handle_ibs_irq(struct pt_regs *regs)
 			if (dev->safe_stack_ptr)
 			{
 				stack_pointer = dev->safe_stack_ptr;
-                stack_pointer -= sizeof(regs->sp);
-                __put_user(regs->sp, *((unsigned long **) &stack_pointer));
-                stack_pointer -= sizeof(regs->ip);
-                __put_user(regs->ip, *((unsigned long **) &stack_pointer));
-                regs->ip = dev->ibs_callback;
-                regs->sp = stack_pointer;
+				stack_pointer -= sizeof(regs->sp);
+				__put_user(regs->sp, *((unsigned long **) &stack_pointer));
+				stack_pointer -= sizeof(regs->ip);
+				__put_user(regs->ip, *((unsigned long **) &stack_pointer));
+				regs->ip = dev->ibs_callback;
+				regs->sp = stack_pointer;
 			}
 		}
 	}
@@ -1593,9 +1593,9 @@ static __init int ibs_init(void)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,11)
 	if(static_cpu_has(X86_FEATURE_PTI))
-	    pr_info("IBS: kernel page table isolation (PTI) is enabled.\n");
+		pr_info("IBS: kernel page table isolation (PTI) is enabled.\n");
 	else
-	    pr_info("IBS: kernel page table isolation (PTI) is disabled.\n");
+		pr_info("IBS: kernel page table isolation (PTI) is disabled.\n");
 #endif
 
 	err = setup_ibs_irq();

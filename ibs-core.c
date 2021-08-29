@@ -1012,6 +1012,9 @@ struct ibs_dev {
 
 	int ibs_thread;               /* ID of threads registered to this device. */
 	unsigned long ibs_callback;   /* Callback functions to give control for each registered thread. */
+	unsigned long safe_stack_ptr;	/* Points to the base of the safe alternate stack. */
+	unsigned long safe_mem_addr;	/* Memory area where safety make CFV */
+	size_t safe_mem_size;			/* Size of safe memory area */
 	unsigned long text_start;     /* Program's text section start address. */
 	unsigned long text_end;       /* Program's text section end address. */
 
@@ -1052,9 +1055,12 @@ static void init_ibs_dev(struct ibs_dev *dev, int cpu, int flavor)
 	mutex_init(&dev->ctl_lock);
 
 	dev->ibs_thread = -1;
-	dev->ibs_callback = 0x0;
-	dev->text_start = 0x0;
-	dev->text_end = 0x0;
+	dev->ibs_callback = 0UL;
+	dev->safe_stack_ptr = 0UL;
+	dev->safe_mem_addr = 0UL;
+	dev->safe_mem_size = 0;
+	dev->text_start = 0UL;
+	dev->text_end = 0UL;
 
 	dev->cpu = cpu;
 	dev->flavor = flavor;
@@ -1391,9 +1397,12 @@ int ibs_release(struct inode *inode, struct file *file)
 	set_ibs_defaults(dev);
 
 	dev->ibs_thread = -1;
-	dev->ibs_callback = 0x0;
-	dev->text_start = 0x0;
-	dev->text_end = 0x0;
+	dev->ibs_callback = 0UL;
+	dev->safe_stack_ptr = 0UL;
+	dev->safe_mem_addr = 0UL;
+	dev->safe_mem_size = 0;
+	dev->text_start = 0UL;
+	dev->text_end = 0UL;
 
 	atomic_set(&dev->in_use, 0);
 
@@ -1411,14 +1420,6 @@ long ibs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	int cpu = dev->cpu;
 
 	mutex_lock(&dev->ctl_lock);
-
-	if (cmd == SET_CUR_CNT || cmd == SET_CNT || cmd == SET_MAX_CNT || cmd == SET_CNT_CTL || cmd == SET_RAND_EN) {
-		if ((dev->flavor == IBS_OP && dev->ctl & IBS_OP_EN) ||
-				(dev->flavor == IBS_FETCH && dev->ctl & IBS_FETCH_EN)) {
-			mutex_unlock(&dev->ctl_lock);
-			return -EBUSY;
-		}
-	}
 
 	switch (cmd) {
 		case IBS_ENABLE:
@@ -1452,9 +1453,33 @@ long ibs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 		case IBS_UNREGISTER_THREAD:
 			dev->ibs_thread = -1;
-			dev->ibs_callback = 0x0;
+			dev->ibs_callback = 0UL;
 			pr_info("IBS:   %s-Dev DEREGISTER THREAD %d on CPU %d.\n",
 				(dev->flavor == IBS_OP) ? "OP" : "FETCH", current->pid, dev->cpu);
+			break;
+		case IBS_REGISTER_SAFE_MEM_ADDR:
+			dev->safe_mem_addr = arg;
+			break;
+		case IBS_REGISTER_SAFE_MEM_SIZE:
+			if (dev->safe_mem_addr == 0UL)
+			{
+				pr_err("IBS:   %s-Dev cannot REGISTER STACK-SIZE for thread %d on CPU %d.\n",
+					(dev->flavor == IBS_OP) ? "OP" : "FETCH", current->pid, dev->cpu);
+				retval = -EPERM;
+			}
+			else if (arg < 1024UL)
+			{
+				pr_err("IBS:   %s-Dev cannot REGISTER STACK-ADDRESS for thread %d on CPU %d.\n",
+					(dev->flavor == IBS_OP) ? "OP" : "FETCH", current->pid, dev->cpu);
+				retval = -EINVAL;
+			}
+			else
+			{
+				dev->safe_mem_size = (size_t) arg;
+				dev->safe_stack_ptr = (dev->safe_mem_addr + arg) & ~(L1_CACHE_BYTES - 1);
+				pr_info("IBS:   %s-Dev REGISTER STACK for thread %d on CPU %d.\n",
+					(dev->flavor == IBS_OP) ? "OP" : "FETCH", current->pid, dev->cpu);
+			}
 			break;
 		case IBS_SET_TEXT_START:
 			dev->text_start = arg;
@@ -1465,24 +1490,6 @@ long ibs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			dev->text_end = arg;
 			pr_info("IBS:    %s-Dev SET TEXT-END to 0x%lx for thread %d on CPU %d.\n",
 				(dev->flavor == IBS_OP) ? "OP" : "FETCH", arg, current->pid, dev->cpu);
-			break;
-		case SET_CUR_CNT:
-		case SET_CNT:
-			break;
-		case GET_CUR_CNT:
-		case GET_CNT:
-			break;
-		case SET_MAX_CNT:
-			break;
-		case GET_MAX_CNT:
-			break;
-		case SET_CNT_CTL:
-			break;
-		case GET_CNT_CTL:
-			break;
-		case SET_RAND_EN:
-			break;
-		case GET_RAND_EN:
 			break;
 		default:	/* Command not recognized */
 			retval = -ENOTTY;
@@ -1504,7 +1511,11 @@ void handle_ibs_irq(struct pt_regs *regs)
 	struct pt_regs *old_regs;
 	struct ibs_dev *dev;
 
+	apic->write(APIC_EOI, APIC_EOI_ACK);
+
 	preempt_disable();
+
+	old_regs = set_irq_regs(regs);
 
 	dev = this_cpu_ptr(pcpu_op_dev);
 
@@ -1515,7 +1526,7 @@ void handle_ibs_irq(struct pt_regs *regs)
 		if (!(tmp & IBS_OP_MAX_CNT_MAX))
 		{
 			wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
-			apic->write(APIC_EOI, APIC_EOI_ACK);
+			set_irq_regs(old_regs);
 			preempt_enable();
 			return;
 		}
@@ -1525,34 +1536,42 @@ void handle_ibs_irq(struct pt_regs *regs)
 	if(current->mm == NULL)
 	{
 		wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
-		apic->write(APIC_EOI, APIC_EOI_ACK);
+		set_irq_regs(old_regs);
 		preempt_enable();
 		return;
 	}
 
 	/* Interrupted in kernel mode. */
-	if ((old_regs = set_irq_regs(regs)) != NULL)
+	if (old_regs != NULL)
 	{
-		set_irq_regs(old_regs);
 		wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
-		apic->write(APIC_EOI, APIC_EOI_ACK);
+		set_irq_regs(old_regs);
 		preempt_enable();
 		return;
 	}
 
-	if (dev->ibs_thread == current->pid && dev->ibs_callback != regs->ip &&
-			dev->text_start <= regs->ip && dev->text_end >= regs->ip)
+	/* Is this thread registered? */
+	if (dev->ibs_thread == current->pid)
 	{
-		stack_pointer = regs->sp;
-		stack_pointer -= sizeof(regs->ip);
-		__put_user(regs->ip, *((unsigned long **) &stack_pointer));
-		regs->sp = stack_pointer;
-		regs->ip = dev->ibs_callback;
+		/* Is this thread interrupted in a safe region? */
+		if (dev->text_start <= regs->ip && dev->text_end >= regs->ip)
+		{
+			/* Has this thread registered a memory-locked stack area? */
+			if (dev->safe_stack_ptr)
+			{
+				stack_pointer = dev->safe_stack_ptr;
+                stack_pointer -= sizeof(regs->sp);
+                __put_user(regs->sp, *((unsigned long **) &stack_pointer));
+                stack_pointer -= sizeof(regs->ip);
+                __put_user(regs->ip, *((unsigned long **) &stack_pointer));
+                regs->ip = dev->ibs_callback;
+                regs->sp = stack_pointer;
+			}
+		}
 	}
 
-	set_irq_regs(old_regs);
 	wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
-	apic->write(APIC_EOI, APIC_EOI_ACK);
+	set_irq_regs(old_regs);
 	preempt_enable();
 	return;
 }

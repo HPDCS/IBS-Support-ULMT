@@ -63,22 +63,13 @@
  *                meaningful for op devices.)
  */
 
-#define IBS_ENABLE				(1U << 2)
-#define IBS_DISABLE				(1U << 3)
-#define IBS_REGISTER_THREAD		(1U << 4)
-#define IBS_UNREGISTER_THREAD	(1U << 5)
-#define IBS_SET_TEXT_START		(1U << 6)
-#define IBS_SET_TEXT_END		(1U << 7)
-
-#define SET_CUR_CNT				(1U << 8)
-#define GET_CUR_CNT				(1U << 9)
-#define SET_CNT					(1U << 10)
-#define GET_CNT					(1U << 11)
-#define SET_MAX_CNT				(1U << 12)
-#define GET_MAX_CNT				(1U << 13)
-#define SET_CNT_CTL				(1U << 14)
-#define GET_CNT_CTL				(1U << 15)
-#define SET_RAND_EN				(1U << 16)
-#define GET_RAND_EN				(1U << 17)
+#define IBS_ENABLE                  (1U << 2)
+#define IBS_DISABLE                 (1U << 3)
+#define IBS_REGISTER_THREAD         (1U << 4)
+#define IBS_UNREGISTER_THREAD       (1U << 5)
+#define IBS_REGISTER_SAFE_MEM_ADDR  (1U << 6)
+#define IBS_REGISTER_SAFE_MEM_SIZE  (1U << 7)
+#define IBS_SET_TEXT_START          (1U << 8)
+#define IBS_SET_TEXT_END            (1U << 9)
 
 #endif        /* IBS_API_H */

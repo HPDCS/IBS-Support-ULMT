@@ -130,6 +130,12 @@ static unsigned int *call_operand_address = NULL;
 static gate_desc old_ibs;
 
 
+/* The following entry point is goind to be
+   removed and the management of the interrupt
+   replaced with the newest hooking strategy
+   that overwrite the call to the spurious
+   interrupt handler. */
+	
 extern void ibs_entry(void);
 asm(
 "    .globl ibs_entry\n"

@@ -1517,8 +1517,6 @@ void handle_ibs_irq(struct pt_regs *regs)
 	struct pt_regs *old_regs;
 	struct ibs_dev *dev;
 
-	apic->write(APIC_EOI, APIC_EOI_ACK);
-
 	preempt_disable();
 
 	dev = this_cpu_ptr(pcpu_op_dev);

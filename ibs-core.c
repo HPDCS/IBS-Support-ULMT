@@ -1521,8 +1521,6 @@ void handle_ibs_irq(struct pt_regs *regs)
 
 	preempt_disable();
 
-	old_regs = set_irq_regs(regs);
-
 	dev = this_cpu_ptr(pcpu_op_dev);
 
 	/* AMD family 10th workaround. */
@@ -1531,8 +1529,8 @@ void handle_ibs_irq(struct pt_regs *regs)
 		rdmsrl(MSR_IBS_OP_CTL, tmp);
 		if (!(tmp & IBS_OP_MAX_CNT_MAX))
 		{
+			apic->write(APIC_EOI, APIC_EOI_ACK);
 			wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
-			set_irq_regs(old_regs);
 			preempt_enable();
 			return;
 		}
@@ -1541,17 +1539,18 @@ void handle_ibs_irq(struct pt_regs *regs)
 	/* This is a kernel thread. */
 	if(current->mm == NULL)
 	{
+		apic->write(APIC_EOI, APIC_EOI_ACK);
 		wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
-		set_irq_regs(old_regs);
 		preempt_enable();
 		return;
 	}
 
 	/* Interrupted in kernel mode. */
-	if (old_regs != NULL)
+	if ((old_regs = set_irq_regs(regs)) != NULL)
 	{
-		wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
 		set_irq_regs(old_regs);
+		apic->write(APIC_EOI, APIC_EOI_ACK);
+		wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
 		preempt_enable();
 		return;
 	}
@@ -1576,8 +1575,9 @@ void handle_ibs_irq(struct pt_regs *regs)
 		}
 	}
 
-	wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
 	set_irq_regs(old_regs);
+	apic->write(APIC_EOI, APIC_EOI_ACK);
+	wrmsrl(MSR_IBS_OP_CTL, dev->ctl);
 	preempt_enable();
 	return;
 }
